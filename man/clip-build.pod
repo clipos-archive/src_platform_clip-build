@@ -1,0 +1,102 @@
+=pod
+
+=head1 NAME
+
+I<clip-build> - CLIP binary package generation tool.
+
+=head1 DESCRIPTION
+
+The I<clip-build> package installs the tools used in 
+CLIP developpment to generate binary (I<.deb>) packages. The
+B<clip-build> script runs B<emerge> commands in a specific 
+environment on a build host, either to build binary packages 
+for CLIP systems, or to install the build dependencies of those
+packages on the build host. It sets up the build environment based
+on an XML 'specification' file, also known as a 'spec file'. 
+Different spec files are used to generate different binary CLIP
+distributions, from a common set of ebuilds and distfiles.
+
+This manpage simply lists the utilities installed by the I<clip-build>
+package, and their configuration files. For further information, the
+reader should refer to each utility's inline help, which is displayed
+when that utility is run without arguments.
+
+=head1 COMMANDS
+
+=over 20
+
+=item B<clip-build>
+
+Main CLIP build utility, used to generate binary packages or install
+their build dependencies based on a spec file. It is fairly complex and 
+should generally not be called directly for usual tasks - use of the 
+B<clip-compile> wrapper is recommended except in very specific cases.
+
+=item B<clip-compile>
+
+Simpler wrapper around B<clip-build>, that should be enough for most simple
+tasks.
+
+=item B<clip-specpp>
+
+Utility called by B<clip-build> to preprocess spec files. Should usually not
+be called directly.
+
+=back
+
+=head1 FILES
+
+=head2 Configuration files
+
+The I<clip-build> package installs a single configuration file, F</etc/clip-build.conf>,
+defining a number of elements (paths, keys, maintainer identity, ...) which should be 
+personnalized for every build host. Refer to the comments in the installed file for more
+details.
+
+=head2 Spec files
+
+The specification files used by B<clip-build> are XML files with a relatively simple syntax.
+They are generally to be found in the I<specs> subdirectory of the I<clip-int> file tree 
+(CLIP integration tree, also containing the ebuilds and distfiles). B<clip-compile> automatically
+uses spec files from that tree (which it finds through the I<CLIP_BASE> variable defined in
+F</etc/clip-build.conf>). The syntax for those files is summed up in the 
+F<[prefix]/share/clip-build/clip-build.dtd> DTD file.
+
+Spec files are automatically preprocessed by B<clip-specpp> before use. This preprocessing includes
+a call to the C preprocessor (B<cpp>), therefore spec files may include, on top of the XML syntax,
+C preprocessor directives (I<#include>, I<#ifdef>, I<#endif>, ...) and macros that will be substituted
+before use. Such macros may be defined either in F</etc/clip-build.conf> (I<CLIP_SPEC_DEFINES> variable)
+or directly on B<clip-build>'s command line.
+
+=head1 EXAMPLES
+
+To pretend building (i.e. see what building would do, without actually doing it, like B<emerge -pv>) 
+a binary package for I<app-clip/clip-foo> for CLIP-RM / CLIP (core):
+  B<clip-compile clip-rm/clip --pretend -pkgn app-clip/clip-foo>
+
+To binary packages for all packages referenced by the I<foo> package subtree in 
+the RM spec for CLIP-RM (i.e. all packages in the '<pkg><pkgkey>foo</pkgkey>...</pkg>' 
+subtree of the spec file:
+  B<clip-compile clip-rm/rm -pkgk foo>
+
+To build all the binary packages for CLIP-GTW:
+  B<clip-compile clip-gtw/clip>
+
+To install the build dependencies for package I<app-clip/clip-foo> on the build host, with a configuration
+appropriate for building CLIP-RM packages:
+  B<clip-compile clip-rm/clip --depends -pkgn app-clip/clip-foo>
+
+To do the same, and also build I<Gentoo> binary packages of the installed ebuilds (for later use on other 
+build hosts):
+  B<clip-compile clip-rm/clip --buildpkg --depends -pkgn app-clip/clip-foo>
+
+
+=head1 AUTHOR 
+
+Vincent Strubel <L<clipos@ssi.gouv.fr>>
+
+=head1 SEE ALSO
+
+L<clip-devutils(7)|clip-devutils>, L<portage(5)|portage>, L<emerge(1)|emerge>
+ 
+=cut

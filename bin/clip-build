@@ -1,0 +1,1070 @@
+#!/usr/bin/env perl
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+#
+#  clip-build - launch a series of complex emerge commands 
+#  based on an XML configuration file.
+#  Copyright (C) 2006-2009 SGDN/DCSSI
+#  Copyright (C) 2010-2011 ANSSI
+#  Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+#  All rights reserved.
+#
+
+
+use strict;
+use warnings;
+use Cwd;
+use Getopt::Long;
+use File::Copy;
+use File::Path;
+use XML::Simple;
+
+###############################################################
+###                       Global Vars                       ###
+###############################################################
+
+################### Consts ########################
+my $make_conf 		= "/etc/make.conf";
+my $make_skel 		= "/etc/make.skel";
+my $make_profile 	= "/etc/make.profile";
+my $etc_portage 	= "/etc/portage";
+
+# global options, as passed on command line
+my $g_cli_opts = {
+	portagedir	=> "",  # path to base portage directory
+	rootdir 	=> "", 	# path to build directory
+	pkgdir 		=> "", 	# path to package directory
+	debdir		=> "",	# path to .deb directory
+	depends		=> 0,	# bool: emerge build depends on host, rather than 
+				# compiling packages
+	defines		=> "",  # macro definitions for spec preprocessing
+	usepkg 		=> 0, 	# bool: use package if available
+	builddeb	=> 0,	# bool: build debian packages
+	buildsrcdeb	=> 0,	# bool: build src debian packages
+	buildpkg 	=> 0, 	# bool: build package
+	pretend 	=> 0,	# bool: do not perform merges, only print cmds
+	verbosity 	=> 0, 	# int: verbosity level
+	env 		=> "", 	# string (varname=value,var2...): other env vars
+	overlays 	=> "", 	# string: portdir overlays
+	features 	=> "", 	# string: portage features
+	spec 		=> "", 	# string: spec file
+	cflags 		=> "",	# CFLAGS
+	ldflags 	=> "",  # LDFLAGS
+	options		=> "",	# emerge options
+	configs		=> "",  # list of configs to build
+	profilesdir     => "",  # path to base portage profiles directory
+};
+
+# global make options -> /etc/make.conf
+# Defined by cli, spec and config
+# Order of precedence is cli > config > spec
+my $g_make_opts = {
+	use 		=> "", 	
+	cflags 		=> "", 	
+	ldflags 	=> "", 
+	features 	=> "",
+	env 		=> "",
+	profile 	=> "",	# path relative to $g_cli_opts->{'$profilesdir'}
+};
+
+# current directory options -> /etc/make.conf
+# Defined by cli, and config, not spec.
+# Order of precedence is config > cli
+my $g_dir_opts = {
+	rootdir 	=> "", 
+	pkgdir		=> "",
+	overlays	=> "",
+	mask		=> "",
+	unmask		=> "",
+	keywords	=> "",
+	virtuals	=> "",
+	provided	=> "",
+};
+
+# separators to use between items in $g_make_opts and $g_dir_opts fields
+# if no separator is defined, updates replace instead of appending
+my $g_opts_seps = {
+	use		=> " ",
+	cflags		=> " ",
+	ldflags		=> " ",
+	features	=> " ",
+	env		=> ",",
+	rootdir		=> "/",
+	pkgdir		=> "/",
+	overlays	=> " ",
+	provided	=> " ",
+	mask		=> " ",
+	unmask		=> " ",
+};
+
+# map keywords to override file path relative to /etc/portage
+my $g_port_files = {
+	provided	=> "profile/package.provided",
+	virtuals	=> "profile/virtuals",
+	mask		=> "package.mask",
+	unmask		=> "package.unmask",
+	keywords	=> "package.keywords",
+};
+
+# current state: things to undo on exit at this stage
+# store (key := file/dir name) => (bool := rollback_p)
+my $g_rollback_tasks = {
+	$make_conf 	=> 0,
+	$make_profile  	=> 0,
+	$etc_portage	=> 0,
+};
+
+# Override options names, and patterns of cmd line options they
+# override
+my $g_override_opts = {
+	nopkg		=> [ "-b", "--buildpkg" ],
+	nousepkg	=> [ "-k", "--usepkg"   ],
+};
+
+# Possibly harmful variables to be unset from environment on startup
+my $g_harmful_env =   [
+	"USE","CFLAGS","LDFLAGS", "FEATURES", "PORTDIR",
+	"PORTDIR_OVERLAY", "ROOT", "PKGDIR", "ACCEPT_KEYWORDS",
+	"CPREFIX", "DEB_NAME_SUFFIX", "CLIP_VROOTS" 
+];
+
+
+# Options that a specific package can define, to be passed
+# on emerge command line environment
+my $g_pkg_opts = [
+	'cflags','ldflags','use','features','accept_keywords',
+];
+
+# reference to spec (parsed)
+my $g_spec;
+
+# pre-processed spec path
+my $g_spec_path;
+
+# work directory at start of program
+my $g_workdir;
+
+# program name
+my $g_progname;
+
+###############################################################
+###                      Prototypes                         ###
+###############################################################
+sub usage ($);
+sub grumble ($);
+sub perish ($);
+sub agonize ($);
+sub debug1 ($);
+sub debug2 ($);
+sub parseCmdLine ();
+sub sanitizeEnv ();
+sub setUpBuildEnv ();
+sub cleanExit ($$);
+
+sub preprocessSpec ($);
+sub parseSpec ($);
+sub buildConfig ($);
+
+###############################################################
+###                        Main                             ###
+###############################################################
+$g_workdir = cwd() or die "Cannot get current directory. Film at 11";
+$g_progname = $0;
+$g_progname =~ s:.*\/::;
+
+if (not parseCmdLine()) {
+	usage(*STDERR{IO});
+	die "Wrong options, aborted";
+}
+
+sanitizeEnv();
+
+# Main block under die handler
+{
+	local $SIG{__DIE__} = sub {cleanExit("Exception in main block: @_", 1)};
+	# Handle SIGINT as well for convenience
+	local $SIG{'INT'} = sub {cleanExit("Interrupted", 1)};
+	
+	$g_spec_path = preprocessSpec($g_cli_opts->{'spec'});
+	$g_spec = parseSpec($g_spec_path);
+
+	my $configs = $g_spec->{'config'};
+
+	debug1("Building spec $g_spec->{'specname'}");
+
+	setUpBuildEnv();
+
+	foreach my $config_id (sort keys %{$configs}) {
+		die "Config with id $config_id has no name;"
+			unless (defined $configs->{$config_id}->{'confname'});
+		buildConfig($configs->{$config_id});
+	}
+
+}
+cleanExit("All clear", 0);
+
+###############################################################
+###                Inner subs prototypes                    ###
+###############################################################
+sub setMakeOpts ($);
+sub setDirOpts ($);
+sub savePortageFiles ();
+sub updatePortageFiles();
+sub rollbackPortageFiles ();
+sub updateBuildEnv ();
+sub printMakeConf ($);
+sub doPkg ($);
+
+###############################################################
+###                        Subs                             ###
+###############################################################
+
+# Print usage on stream passed as argument
+sub usage ($) {
+	my $out = shift;
+	print $out <<ENDHELP;
+
+$g_progname: build packages in a fakeroot according to a spec
+
+  Usage: $g_progname <mandatory options> [<options>]	
+
+  Mandatory options:
+        -s[pecfile] <file>  : use <file> as spec (mandatory).
+        -r[ootdir] <dir>    : use <dir> as the base fakeroot (mandatory).
+        -d <dir>            : user <dir> as portage tree (mandatory)
+  
+  Other options:
+        -h[elp]             : print this help and exit.
+        -v[erbose]          : be more verbose (can be applied several times).
+        -q[uiet]            : be extra quiet.
+        -p[retend]          : print commands, but do not launch them.
+        -u[sepkg]           : use binary packages if available (see -tbz).
+        -b[uildpkg]         : build binary packages (see -tbz).
+	-dep[ends]          : emerge build dependencies on the host
+	-def[ines] <list>   : pass macro definitions from <list> to the specfile
+	                      preprocessing.
+                              Expected format is "var1,var2=<val2>,..."
+        -dp[kg]             : build debian packages (see -T)
+        -srcdp[kg]          : build src debian packages
+        -t[bz] <dir>        : use <dir> as the base directory to store packages.
+        -de[bs] <dir>       : use <dir> as the directory where to store debs
+        -e[nv] <list>       : use <list> as list of environment variables to 
+                              define for the build. 
+                              Expected format is "var1=<val1>,var2=<val2>,..."
+        -op[tions] <str>    : use <str> as space-separated list of options to
+                              pass to emerge.
+        -cf[lags] <str>     : use <str> as default CFLAGS to pass to emerge
+        -l[dflags] <str>    : use <str> as default LDFLAGS to pass to emerge
+        -co[nfigs] <str>    : build only those configs that are listed in <str>
+        -ov[erlays] <list>  : use <list> as space-separated list of portage 
+                              overlays to use during the build.
+        -profilesdir <dir>  : use <dir> as portage profiles base
+        -pkgkey <key>       : only build those groups of packages that have 
+                              their <pkgkey> equal to <key>
+        -pkgnames <list>    : only build those packages that have their name
+                              in <list>
+ENDHELP
+}
+
+# Boohoo, we're not happy. Let user know about it.
+sub grumble ($) {
+	if (not ($g_cli_opts->{'verbosity'} == -1)) {
+		my $msg = shift;
+		print STDERR "$g_progname: Warning: $msg\n";
+	}
+}
+
+# For when we really would like to die, but just can't...
+sub agonize ($) {
+	my $msg = shift;
+	print STDERR "!!!!!! $g_progname: $msg !!!!!\n";
+}
+
+# Die, but in our own particular way :)
+sub perish ($) {
+	my $msg = shift;
+	$msg = "$g_progname : $msg";
+	die $msg;
+}
+
+# First level of debug
+sub debug1 ($) {
+	if ($g_cli_opts->{'verbosity'} > 0) {
+		my $msg = shift;
+		print "DEBUG1: $msg\n";
+	}
+}
+
+# Second level of debug
+sub debug2 ($) {
+	if ($g_cli_opts->{'verbosity'} > 1) {
+		my $msg = shift;
+		print "DEBUG2: $msg\n";
+	}
+}
+
+# Parse cmd line, setup $g_cli_opts
+sub parseCmdLine () {
+    eval {
+       GetOptions (
+	 'specfile=s'	=> \$g_cli_opts->{'spec'},
+         'help'		=> sub {usage(*STDOUT{IO}); exit 0},
+         'verbose+' 	=> \$g_cli_opts->{'verbosity'},
+         'quiet'    	=> sub {$g_cli_opts->{'verbosity'} = -1},
+         'pretend' 	=> \$g_cli_opts->{'pretend'},
+	 'rootdir=s'	=> \$g_cli_opts->{'rootdir'},
+         'buildpkg' 	=> \$g_cli_opts->{'buildpkg'},
+	 'depends'	=> \$g_cli_opts->{'depends'},
+	 'defines=s'	=> \$g_cli_opts->{'defines'},
+         'dpkg' 	=> \$g_cli_opts->{'builddeb'},
+         'srcdpkg' 	=> \$g_cli_opts->{'buildsrcdeb'},
+         'usepkg' 	=> \$g_cli_opts->{'usepkg'},
+	# grrr, cannot have a -pkgdir without making -p ambiguous..
+	 'tbz=s'	=> \$g_cli_opts->{'pkgdir'},
+	 'debs=s'	=> \$g_cli_opts->{'debdir'},
+	 'env=s'	=> \$g_cli_opts->{'env'},
+	 'cflags=s'	=> \$g_cli_opts->{'cflags'},
+	 'ldflags=s'	=> \$g_cli_opts->{'ldflags'},
+	 'options=s'	=> \$g_cli_opts->{'options'},
+	 'configs=s'	=> \$g_cli_opts->{'configs'},
+	 'overlay=s'	=> \$g_cli_opts->{'overlays'},
+	 'dir=s'	=> \$g_cli_opts->{'portagedir'},
+	 'profilesdir=s'=> \$g_cli_opts->{'profilesdir'},
+	 'pkgkey=s'	=> \$g_cli_opts->{'pkgkey'},
+	 'pkgnames=s'	=> \$g_cli_opts->{'pkgnames'},
+       ) or die 1;
+    };
+
+    return 0 if ($@);
+    
+    my $specfile = $g_cli_opts->{'spec'};
+    my $portagedir = $g_cli_opts->{'portagedir'};
+    my $rootdir = $g_cli_opts->{'rootdir'};
+    my $pkgdir = $g_cli_opts->{'pkgdir'};
+    my $debdir = $g_cli_opts->{'debdir'};
+
+    if (not $portagedir) {
+	print STDERR "Please specify a portage directory\n";
+	return 0;
+    }
+    if (not $specfile) {
+	print STDERR "Please specify a spec file\n";
+	return 0;
+    }
+    if (not $rootdir) {
+	print STDERR "Please specify a build directory\n";
+	return 0;
+    }
+    if (not $g_cli_opts->{'profilesdir'}) {
+    	$g_cli_opts->{'profilesdir'}=$g_cli_opts->{'portagedir'}."/profiles";
+    }
+
+    if (not $rootdir =~ /^\//) {
+	$rootdir = $g_cli_opts->{'rootdir'} = "$g_workdir/$rootdir";
+	grumble("rootdir set relative to current work directory: $rootdir");
+    }
+    if ($pkgdir and not $pkgdir =~ /^\//) {
+	$pkgdir = $g_cli_opts->{'pkgdir'} = "$g_workdir/$pkgdir";
+	grumble("package directory set relative to current work".
+			" directory: $pkgdir");
+    }
+
+    if ((-e $rootdir and not -d $rootdir) or 
+	(-d $rootdir and (not -w $rootdir or not -x $rootdir))) {
+		print STDERR "Build directory $rootdir is not writable\n";
+		return 0;
+    }
+
+    if ($g_cli_opts->{'usepkg'}) {
+	if (not $pkgdir or ( -e $pkgdir and not -d $pkgdir) 
+	    or ( -d $pkgdir and (not -r $pkgdir or not -x $pkgdir))) {
+		print STDERR "Package directory $pkgdir cannot be accessed", 
+			" for reading\n";
+		return 0;
+	}
+	$g_cli_opts->{'options'} .= " --usepkg";
+    }
+    if ($g_cli_opts->{'buildpkg'}) {
+	if (not $pkgdir or ( -e $pkgdir and not -d $pkgdir) 
+	    or ( -d $pkgdir and (not -w $pkgdir or not -x $pkgdir))) {
+		print STDERR "Package directory $pkgdir cannot be accessed",
+			" for writing\n";
+		return 0;
+	}
+	$g_cli_opts->{'options'} .= " --buildpkg";
+    }
+    if ($g_cli_opts->{'depends'}) {
+    	$g_cli_opts->{'options'} .= " --onlydeps --bdeps-only -u";
+    }
+    if ($g_cli_opts->{'builddeb'}) {
+	if (not $debdir or ( -e $debdir and not -d $debdir) 
+	    or ( -d $debdir and (not -w $debdir or not -x $debdir))) {
+		print STDERR "Deb directory $debdir cannot be accessed",
+			" for writing\n";
+		return 0;
+	}
+	$g_cli_opts->{'options'} .= " --builddebonly --nodeps";
+    }
+    if ($g_cli_opts->{'buildsrcdeb'}) {
+	if (not $debdir or ( -e $debdir and not -d $debdir) 
+	    or ( -d $debdir and (not -w $debdir or not -x $debdir))) {
+		print STDERR "Deb directory $debdir cannot be accessed",
+			" for writing\n";
+		return 0;
+	}
+	$g_cli_opts->{'options'} .= " --buildsrcdebonly --nodeps";
+    }
+
+    return 1;
+}
+
+# Sanitize environment by unsetting any portage-related variables 
+# that we may or may not override afterwards
+sub sanitizeEnv () {
+	foreach (@{$g_harmful_env}) {
+		if (defined $ENV{$_}) {
+			grumble("$_ defined in env, unsetting it\n");
+			delete $ENV{$_};
+		}
+	}
+}
+
+# Setup all files needed for building the spec
+# Keep track of those to rollback through $g_rollback_tasks
+sub setUpBuildEnv () {
+	my $env = $g_cli_opts->{'env'};
+	my $rootdir = $g_cli_opts->{'rootdir'};
+	my $pkgdir = $g_cli_opts->{'pkgdir'};
+	my $debdir = $g_cli_opts->{'debdir'};
+
+	if (not $g_cli_opts->{'pretend'}) {
+	if (not -e $rootdir) {
+		grumble("creating $rootdir");
+		mkpath($rootdir) or die "Cannot create build dir $rootdir;";
+	}
+	if ($pkgdir and not -e $pkgdir) {
+		grumble("creating $pkgdir");
+		mkpath($pkgdir) or die "Cannot create package dir $pkgdir;";
+	}
+	if ($debdir and not -e $debdir) {
+		grumble("creating $debdir");
+		mkpath($debdir) or die "Cannot create package dir $debdir;";
+	}
+	}
+
+	savePortageFiles();
+
+	return 1;
+}
+
+# Exit cleanly: rollback those files that need it
+sub cleanExit ($$) {
+	my ($msg, $excode) = @_;
+	my $out = ($excode)? *STDERR{IO} : *STDOUT{IO};
+	rollbackPortageFiles();
+	unlink($g_spec_path) if ($g_spec_path);
+	print $out "\n\n$g_progname: $msg\n";
+	exit $excode;
+}
+
+# Preprocess a specfile, write the preprocessed file to
+# /tmp/$(basename <spec>).XXXXXX and return that path.
+sub preprocessSpec ($) {
+	my $in = shift;
+
+	die "No spec specified !" unless ($in);
+
+	my $tmpname = $ENV{'TMPDIR'};
+	$tmpname = "/tmp" unless ($tmpname);
+
+	my $basename;
+	if ($in =~ /\.*\/([^\/]+)/) {
+		$basename = $1;
+	} else {
+		$basename = $in;
+	}
+
+	my $out = `mktemp $tmpname/$basename.XXXXXX`;
+	chomp $out;
+	die "mktemp $tmpname/$basename failed" unless ($out);
+
+	my @cmd = ("clip-specpp", "-i", $in, "-o", $out);
+	
+	push @cmd, ("-defs", $g_cli_opts->{'defines'}) if ($g_cli_opts->{'defines'});
+	my $ret = system(@cmd);
+	die "Preproccessing of $in failed" if ($ret);
+
+	return $out;
+}
+
+# Parse specfile, return a reference to a hash representation of
+# spec on success
+sub parseSpec ($) {
+	my $filename = shift;
+
+	die "$filename not readable;"
+		if (not -r $filename or not -f $filename);
+
+	my $xml = new XML::Simple or die "Cannot allocate XML parser;";
+
+	my $spec = $xml->XMLin($filename, ForceArray => [ 'pkg' ]) 
+		or die "Error parsing XML spec;";
+
+	return $spec;
+}
+
+# For each config it is called on, update the general options
+# for that config and set up all needed portage files accordingly,
+# then build every package in that config, or die trying.
+sub buildConfig ($) {
+	my $config = shift;
+	my $confname = $config->{'confname'};
+
+	my $build_confs = $g_cli_opts->{'configs'};
+	if ($build_confs and not 
+		grep {/^$confname$/} (split ' ',$build_confs)) {
+			print "\n$g_progname: Skipping config $confname...\n\n" 
+				unless ($g_cli_opts->{'verbosity'} < 0);
+			return 1;
+	}
+	my $pkgs;
+	if (not defined ($pkgs = $config->{'pkg'})) {
+		grumble("Config $confname has no packages, skipping it");
+		return 1;
+	}
+
+
+	debug1("Building config: $config->{'confname'}");
+	setMakeOpts($config);
+	setDirOpts($config);
+	updatePortageFiles();
+	updateBuildEnv();
+
+	foreach my $pkg_id (sort keys %{$pkgs}) {
+		doPkg($pkgs->{$pkg_id}) 
+			or die "Failed on package with id $pkg_id;";
+	}
+	return 1;
+}
+
+###############################################################
+###                     Inner Subs                          ###
+###############################################################
+
+# Common helper for setMakeOpts and setDirOpts
+sub updateOpts ($$); 
+
+# Update portage options for the current config
+# Enforce cascading cli opts > current config > spec
+sub setMakeOpts ($) {
+	my $config = shift;
+
+	foreach (keys %{$g_make_opts}) {
+		$g_make_opts->{$_} = "";
+	}
+
+	my $retval = 0;
+
+	updateOpts($g_make_opts, $g_spec) and 
+		updateOpts($g_make_opts, $config) and
+		updateOpts($g_make_opts, $g_cli_opts) and
+		$retval = 1;
+
+	return $retval;
+}
+
+# Update dir opts with those defined by a config. These are appended 
+# to those settings passed on command line so that in that case
+# the precedence is config > spec > cli opts
+sub setDirOpts ($) {
+	my $config = shift;
+	my $retval = 0;
+
+	foreach (keys %{$g_dir_opts}) {
+		$g_dir_opts->{$_} = "";
+	}
+
+	updateOpts($g_dir_opts, $g_cli_opts) and
+		updateOpts($g_dir_opts, $g_spec) and 
+		updateOpts($g_dir_opts, $config) and
+		$retval = 1;
+
+	if ($g_cli_opts->{'verbosity'} > 1) {
+		foreach (keys %{$g_dir_opts}) {
+			print "DEBUG2: Dir opts $_: $g_dir_opts->{$_}\n";
+		}
+	}
+	return $retval;
+}
+
+# filter option strings - notably when emerging on the host system
+# Returns the new option value
+sub filterOpts ($$) {
+	my ($optname, $optval) = @_;
+
+	# We only filter when building for the host, at the moment
+	return $optval unless ($g_cli_opts->{'depends'});
+
+	if ($optname eq "rootdir") {
+		$optval = "";
+	} elsif ($optname eq "env") { 
+		# Filter out CPREFIX, CLIP_VROOTS
+		$optval =~ s/CPREFIX=[^,]+//g;
+		$optval =~ s/CLIP_VROOTS=[^,]+//g;
+	} elsif ($optname eq "ldflags") {
+		# Filter out hardcoded RPATH
+		$optval =~ s/-Wl,-rpath,\S+//g; 
+	} elsif ($optname eq "use") {
+		# Replace 'clip' USE flag with 'clip-devstation'
+		$optval =~ s/\bclip(\s)/clip-devstation$1/g;
+		# Remove *-deps altogether
+		foreach my $kw (qw(clip-deps core-deps rm-deps clip-core clip-rm)) {
+			$optval =~ s/\b$kw\b//g;
+		}
+		# Always add nls support
+		$optval =~ s/(\s)-nls/$1nls/g;
+	} elsif ($optname eq "features") {
+		# Do install manpages, includes, static libs and so forth...
+		foreach my $kw (qw(nodoc noman noinclude nostatlib nosuid noinfo nolocales)) {
+			$optval =~ s/\b$kw\b//g;
+		}
+	} elsif ($optname eq "profile") {
+		# Replace 'clip-build' profile with 'clip-dev'
+		$optval =~ s/clip-build/clip-dev/g;
+	}
+
+	return $optval;
+}
+
+# Update hash $orig for one level of representation
+# as carried by hash $delta
+sub updateOpts ($$) {
+	my ($orig, $delta) = @_;
+	my $tmp;
+	my $val;
+
+OPTLOOP:
+	foreach my $key (keys %{$orig}) {
+		if (not (defined ($tmp = $delta->{$key}) and $tmp)) {
+			next OPTLOOP;
+		}
+
+		$val = filterOpts($key, $tmp);
+		next OPTLOOP unless ($val);
+
+# Field is empty
+		if (not $orig->{$key}) {
+			$orig->{$key} = $val;
+			next OPTLOOP;
+		}
+# Field is not appendable anyway
+		if (not defined $g_opts_seps->{$key}) {
+			$orig->{$key} = $val;
+			next OPTLOOP;
+		}
+# Field is appendable
+		$orig->{$key} = $orig->{$key}.$g_opts_seps->{$key}.$val;
+	}
+
+	return 1;
+}
+
+# Perform portage file bkps and links
+sub savePortageFiles () {
+	debug1("savePortageFiles");
+	return 1 if ($g_cli_opts->{'pretend'});
+
+	foreach my $portfile (keys %{$g_rollback_tasks}) {
+		debug2("save $portfile");
+		die "$portfile.perlbkp exists, I won't overwrite it;"
+			if (-l "$portfile.perlbkp" or -e "$portfile.perlbkp"
+					or -d "$portfile.perlbkp");
+
+# Pre-set the rollback flag to avoid a possible race 
+# We will check for $portfile.perlbkp before rollbacking anyway
+		$g_rollback_tasks->{$portfile} = 1;
+		move ($portfile, "$portfile.perlbkp") 
+			or die "Cannot move $portfile;";
+	}
+
+	return 1;
+}
+
+# Write out current config's parameters to portage files
+sub updatePortageFiles () {
+
+	printMakeConf(*STDOUT{IO}) if 
+		($g_cli_opts->{'verbosity'} > 1 or $g_cli_opts->{'pretend'});
+	die "Profile is not defined" 
+		unless (defined $g_make_opts->{'profile'});
+
+	debug1("Profile: $g_make_opts->{'profile'}");
+
+	return 1 if ($g_cli_opts->{'pretend'});
+
+	## link /etc/make.profile ##
+	# NB: -e matches real files -> directory linked by make.profile...
+	if (-l $make_profile or -e $make_profile) {
+		# unlink behaves as expected, removing the symlink, not
+		# the symlinked file...
+		unlink $make_profile 
+			or die "Cannot unlink $make_profile;";
+	} 
+
+	debug2("linking ".$g_cli_opts->{'profilesdir'}."/"
+			.$g_make_opts->{'profile'}." to ".  $make_profile);
+
+	symlink $g_cli_opts->{'profilesdir'}."/".$g_make_opts->{'profile'}, 
+		$make_profile 
+			or die "Cannot create $make_profile;";
+
+	copy($make_skel, $make_conf) or die "Cannot copy $make_skel";
+	## write /etc/make.conf ##
+	open OUT,">>","$make_conf"
+		or die "Cannot open $make_conf for writing;";
+
+	printMakeConf(*OUT{IO}) 
+		or die "Cannot print $make_conf;";
+
+	close(OUT);
+
+	## write to /etc/portage files ##
+	if (not -d "$etc_portage/profile") {
+		mkpath("$etc_portage/profile") 
+			or die "Cannot create $etc_portage/profile";
+	}
+
+	my $tmp;
+ETCPORTLOOP:
+	foreach my $ext (keys %{$g_port_files}) {
+		next ETCPORTLOOP if (not defined ($tmp = $g_dir_opts->{$ext}));
+		debug1("doing option $ext");
+		
+		my $file = $g_port_files->{$ext};
+		debug2("Putting $tmp in $etc_portage/$file");
+		
+		open OUT, ">", "$etc_portage/$file"
+			or die "Cannot open $etc_portage/$file";
+		
+		foreach (split ',', $tmp) {
+			print OUT "$_\n";
+		}
+		close OUT;
+	}
+	
+	return 1;
+}
+
+# Undo portage file modifications, reading $g_undo_tasks
+sub rollbackPortageFiles () {
+	debug1("rollbackPortageFiles");
+	return 1 if ($g_cli_opts->{'pretend'});
+
+	# Since we set the rollback flag before actually creating the backup, we may
+	# encounter cases where the backup did not actually happen (we got interrupted 
+	# between setting the flag and doing the move(), or we exited because the move
+	# itself was not possible) => there is nothing to rollback in that case.
+	foreach my $portfile (keys %{$g_rollback_tasks}) {
+		if ($g_rollback_tasks->{$portfile} 
+				and not -e "$portfile.perlbkp") {
+			grumble("$portfile.perlbkp is scheduled for rollback but does not exist");	
+			$g_rollback_tasks->{$portfile} = 0;
+		}
+	}
+
+	if ($g_rollback_tasks->{$etc_portage} and -d $etc_portage) {
+		rmtree($etc_portage)
+			or agonize ("Cannot remove temporary $etc_portage");
+	}
+	
+	foreach my $portfile (keys %{$g_rollback_tasks}) {
+		if ($g_rollback_tasks->{$portfile}) {
+			debug2("rolling back $portfile");
+			move("$portfile.perlbkp", $portfile)
+				or agonize("Cannot rollback $portfile");
+			$g_rollback_tasks->{$portfile} = 0;
+		}
+	}
+	return 1;
+}
+
+# Update build directories, create any that are missing.
+sub updateBuildEnv () {
+	return 1 if ($g_cli_opts->{'pretend'});
+
+	my $rootdir = $g_dir_opts->{'rootdir'};
+	my $pkgdir = $g_dir_opts->{'pkgdir'};
+	my $debdir = $g_cli_opts->{'debdir'};
+
+	if ($rootdir and not -d $rootdir) {
+		grumble("creating rootdir $rootdir");
+		mkpath($rootdir) 
+			or die "Cannot create current build dir $rootdir;";
+	}
+	# We only use a pkgdir when one is defined on command line.
+	if ($g_cli_opts->{'pkgdir'}) {
+		if (not -d $pkgdir) {
+			grumble("creating package directory $pkgdir");
+			mkpath($pkgdir)
+			or die "Cannot create current build dir $pkgdir;";
+		}
+	}
+	if ($g_cli_opts->{'debdir'}) {
+		if (not -d $debdir) {
+			grumble("creating package directory $debdir");
+			mkpath($debdir)
+			or die "Cannot create current build dir $debdir;";
+		}
+	}
+	return 1;
+}
+
+# Actually print to the stream passed as argument a make.conf file 
+# reflecting the current g_make_opts and g_dir_opts
+sub printMakeConf($) {
+	my $out = shift;
+
+	my $pkgdir = $g_dir_opts->{'pkgdir'};
+	my $debdir = $g_cli_opts->{'debdir'};
+	my $overlays = $g_dir_opts->{'overlays'};
+
+	print $out <<ENDMK;
+
+######################################################
+#Temporary make.conf generated by script, do not edit#
+######################################################
+
+PORTDIR="$g_cli_opts->{'portagedir'}"
+CONFIG_PROTECT="-*"
+CONFIG_PROTECT_MASK="/etc"
+USE="$g_make_opts->{'use'}"
+FEATURES="$g_make_opts->{'features'}"
+CFLAGS="$g_make_opts->{'cflags'}"
+CXXFLAGS=\"\${CFLAGS}\"
+LDFLAGS="$g_make_opts->{'ldflags'}"
+CONFIG_PROTECT="/etc"
+ENDMK
+	print $out "PKGDIR=\"$pkgdir\"\n"
+			if ($g_cli_opts->{'pkgdir'});
+	print $out "DEBDIR=\"$debdir\"\n"
+			if ($g_cli_opts->{'debdir'});
+	print $out "PORTDIR_OVERLAY=\"$overlays\"\n"
+			if ($overlays);
+	print $out "ROOT=\"$g_dir_opts->{'rootdir'}\"\n"
+			if ($g_dir_opts->{'rootdir'});
+	
+ENVSPLIT:
+	foreach (split ',', $g_make_opts->{'env'}) {
+		if (/\s*([^=]+)\s*=\s*([^=]+)/) {
+			print $out "$1=\"$2\"\n";
+		} else {
+			grumble("wrong env format: [$_]\n") if ($_);
+		}
+	}
+
+	print $out "\n\n";
+
+	return 1;
+}
+
+# Helper for doPkg
+sub childDoPkg($);
+
+# Spawn a child process to set up its env independently...
+sub doPkg($) {
+	my $pkg = shift;
+	my $pid;
+
+	my $key = $g_cli_opts->{'pkgkey'};
+	return 1 if ($key and not ($pkg->{'pkgkey'} eq $key));
+
+	if (not defined ($pid = fork())) {
+		die "doPkg: fork failure. End of the world is near;";
+	} elsif ($pid == 0) {
+		childDoPkg($pkg);
+	} else {
+		waitpid($pid, 0);
+		return 0 if ($?);
+	}
+	return 1;
+}
+
+# Helper: remove those options that are locally overriden
+sub overrideOpts($$);
+# Helper: intersect pkg list with mask
+sub intersectPkgList($$);
+
+# Do the actual work of doPkg in a child process
+sub childDoPkg($) {
+	my $pkg = shift;
+	my $pkgnames = $pkg->{'pkgnames'};
+	my $pkgmask = $g_cli_opts->{'pkgnames'};
+	debug1("Doing package group $pkg->{'pkgkey'}");
+
+	my $tmpvar = "";
+	my $name = "";
+	my $debugstring = "";
+
+	$pkgnames =~ s/\t//g;
+	$pkgnames =~ s/\n/ /g;
+	$pkgnames =~ s/^ //g;
+	if ($pkgmask) {
+		$pkgnames = intersectPkgList($pkgnames, $pkgmask);
+		exit 0 if (not ($pkgnames));
+	}
+
+	# Set up some options that need to be on the command line rather
+	# than /etc/make.conf
+	$tmpvar = $g_dir_opts->{'rootdir'};
+	if ($tmpvar) {
+		$ENV{'ROOT'} = $tmpvar;
+		$debugstring .= "ROOT=\"$tmpvar\"";
+	}
+
+	# Overriding environment through CLI should be allowed (even for
+	# dependencies).
+	$tmpvar = $g_make_opts->{'env'};
+	if ($tmpvar) {
+		foreach (split ',',$tmpvar) {
+			if (/\s*([^=]+)\s*=\s*([^=]+)/) {
+				grumble("Overriding env var $1")
+						if (defined $ENV{$1});
+				$ENV{$1}=$2;
+				$debugstring .= "$1=\"$2\"; ";
+			} else {
+				grumble("wrong env format: [$_]\n") if ($_);
+			}
+		}
+	}
+
+	# For now, we need to keep at least the USE variable for dependencies too.
+	#
+	# FIXME: The useflags used for dependencies installation are not consistent
+	# with what we should get for each package according to the specfile.
+	foreach my $varname (@{$g_pkg_opts}) {
+		if (defined ($tmpvar = $pkg->{$varname})) {
+			my $tmpglob;
+			if (defined ($tmpglob = $g_make_opts->{$varname})) {
+				$tmpvar = $tmpglob.$g_opts_seps->{$varname}.$tmpvar;
+			}
+			my $val = filterOpts($varname, $tmpvar);
+			if ($val) { 
+				# whoa, I just spent an awful amount of debugging time
+				# learning that ENV really is case-sensitive :p
+				$name = uc $varname;
+				grumble("Overriding env var $name")
+						if (defined $ENV{$name});
+				$ENV{$name} = $val;
+				$debugstring .= "$name=\"$val\"; ";
+			}
+		}
+	}
+
+	# Do not alter the environment to keep a deterministic SDK (i.e. the
+	# ebuilds can be installed manually).
+	if (not $g_cli_opts->{'depends'}) {
+		if (defined ($tmpvar = $pkg->{'env'})) {
+			foreach (split ',',$tmpvar) {
+				if (/\s*([^=]+)\s*=\s*([^=]+)/) {
+					grumble("Overriding env var $1")
+							if (defined $ENV{$1});
+					$ENV{$1}=$2;
+					$debugstring .= "$1=\"$2\"; ";
+				} else {
+					grumble("wrong env format: $_\n");
+				}
+			}
+		}
+	}
+
+	my $merge_opts = $g_cli_opts->{'options'};
+	$merge_opts .= " --newuse";
+	
+	if (defined ($tmpvar = $pkg->{'options'})) {
+		$merge_opts .= " $tmpvar";
+	}
+	if (defined ($tmpvar = $pkg->{'optoverride'})) {
+		my $orig_opts = $merge_opts;
+
+		# build dependencies first, without the override
+		$merge_opts .= " --onlydeps --bdeps-only";
+
+		my @cmd_args = split ' ', $merge_opts;
+		if (not $g_cli_opts->{'pretend'}) {
+			$pkgnames =~ s/^[ \n]+//;
+			$pkgnames =~ s/[ \n]+$//;
+			debug1("emerge $merge_opts \'$pkgnames\'");
+			debug1("with env : $debugstring");
+			my $retval = system ("emerge", @cmd_args, (split /[ \n]/, $pkgnames));
+			if ($retval) {
+				agonize("Failed to emerge dependencies for $pkgnames");
+				exit 1;
+			}
+		} else {
+			print "# Env : $debugstring\n" ;
+			print "--> emerge $merge_opts $pkgnames\n";
+		}
+
+		$merge_opts = overrideOpts($orig_opts, $tmpvar);
+		$merge_opts .= " --nodeps";
+	}
+
+	my @cmd_args = split ' ', $merge_opts;
+	if (not $g_cli_opts->{'pretend'}) {
+		$pkgnames =~ s/^[ \n]+//;
+		$pkgnames =~ s/[ \n]+$//;
+		debug1("emerge $merge_opts \'$pkgnames\'");
+		debug1("with env : $debugstring");
+		exec ("emerge", @cmd_args, (split /[ \n]+/, $pkgnames));
+	} else {
+		print "# Env : $debugstring\n" ;
+		print "--> emerge $merge_opts $pkgnames\n";
+		# he he, very nice fork-bomb potential on this one ;-)
+		exit 0;
+	}
+}
+
+sub overrideOpts($$) {
+	my ($opts, $override) = @_;
+
+	my @opts = split ' ', $opts;
+
+	# explode merged single opts, e.g. -pv -> -p -v
+	foreach (@opts) {
+		if (s/^-([^-])/$1/) {
+			s/(\S)/ -$1/g;
+		}
+	}
+	# this is somewhat ugly, but hey, we're doing perl anyway :)
+	my $new_opts = " ".(join ' ', @opts);
+	my $patlist;
+OPTLOOP:
+	foreach my $opt (split ' ',$override) {
+		debug1("Override : $opt");
+		if (not defined ($patlist = $g_override_opts->{$opt})) {
+			grumble("unsupported override option: $opt\n");
+			next OPTLOOP;
+		}
+		foreach (@{$patlist}) {
+			$new_opts =~ s/ $_//g;
+		}
+	}
+	$new_opts =~ s/^ //g;
+	debug2("overrideOpts: $opts => $new_opts");
+	return $new_opts;
+}
+
+sub intersectPkgList($$) {
+	my ($str1, $str2) = @_;
+	my @ret = ();
+
+	my @list1 = split / +/, $str1;
+
+	foreach my $tok (split / +/, $str2) {
+		push @ret, $tok if (grep {$_ eq $tok} @list1);
+	}
+
+	return join " ", @ret;
+}

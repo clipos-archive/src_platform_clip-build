@@ -1,0 +1,139 @@
+#!/bin/bash 
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+#
+#  clip-compile - wrapper around clip-build
+#  Copyright (C) 2010 ANSSI
+#  Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+#  All rights reserved.
+#
+
+CONF_FILE="/etc/clip-build.conf"
+SPEC_FILE="${1}"
+shift
+EXTRA_CONF=""
+
+PROGNAME="$(basename ${0})"
+
+die() {
+	echo "Error: ${1}" >&2
+	exit 1
+}
+
+usage() {
+	echo "${PROGNAME} - user-friendly wrapper for clip-build"
+	echo "Usage: ${PROGNAME} <specname> [opts] [extra_opts]"
+	echo "    with:"
+	echo "      <specname>   : the path of the spec file to use for building,"
+	echo "                     relative to \${CLIP_BASE}/specs/ (ex: clip-rm/clip.spec.xml,"
+	echo "                     or simply clip-rm/clip - will be autocompleted)"
+	echo "      [opts]       : ${PROGNAME} options (starting with '--')"
+	echo "      [extra_opts] : options passed directly to clip-build (starting with '-')"
+	echo "    Options supported by ${PROGNAME}: "
+	echo "      --pretend  : pass -pv to emerge commands"
+	echo "      --depends  : emerge dependencies on the build host, instead of generating .deb packages"
+	echo "      --buildpkg : build Gentoo binary packages (only makes sense with --depends)"
+	echo "      --usepkg   : use Gentoo binary packages (only makes sense with --depends)"
+	echo ""
+	echo "${PROGNAME} reads its configuration from the ${CONF_FILE} configuration file"
+}
+
+die_usage() {
+	usage >&2
+	echo >&2
+	die "${1}"
+}
+
+source "${CONF_FILE}" || die "${CONF_FILE} is missing"
+
+[[ -n "${CLIP_BASE}" ]] || die "CLIP_BASE is not defined (define it in ${CONF_FILE})"
+export CLIP_BASE
+[[ -n "${DEBS_BASE}" ]] || die "DEBS_BASE is not defined (define it in ${CONF_FILE})"
+export DEBS_BASE
+[[ -n "${CLIP_BUILDER}" ]] || die "CLIP_BUILDER is not defined (define it in ${CONF_FILE})"
+export CLIP_BUILDER
+[[ -n "${PKG_DIR}" ]] || die "PKG_DIR is not defined (define it in ${CONF_FILE})"
+[[ -n "${CLIP_MAKEOPTS}" ]] || die "CLIP_MAKEOPTS is not defined (define it in ${CONF_FILE})"
+[[ -n "${CLIP_CHOST}" ]] || die "CLIP_CHOST is not defined (define it in ${CONF_FILE})"
+[[ -n "${CLIP_ARCH}" ]] || die "CLIP_ARCH is not defined (define it in ${CONF_FILE})"
+
+OVERLAYS="${CLIP_BASE}/portage-overlay ${CLIP_BASE}/portage-overlay-clip ${CLIP_BASE}/portage-overlay-extra" 
+MIRRORS="file://${CLIP_BASE}/distfiles file://${CLIP_BASE}/distfiles-extra"
+
+[[ -n "${SPEC_FILE}" ]] || die_usage "No spec file passed in arguments"
+
+SPEC_FILE="${SPEC_FILE%.spec.xml}.spec.xml"
+SPEC_FILE="${CLIP_BASE}/specs/${SPEC_FILE}"
+[[ -f "${SPEC_FILE}" ]] || die "Spec file ${SPEC_FILE} does not exist"
+
+SPECNAME="$(perl -ne '/<specname>(.*)<\/specname>/ and print "$1\n"' "${SPEC_FILE}")"
+[[ -n "${SPECNAME}" ]] || die "Spec file ${SPEC_FILE} does not define a <specname>"
+DEBS_REP="$(echo "${CLIP_SPEC_MAP}" | awk -vspec="${SPECNAME}" '$1 == spec {print $3}')"
+
+[[ -n "${DEBS_REP}" ]] || die "No package subdirectory is defined for spec ${SPECNAME}. Add it to CLIP_SPEC_MAP in ${CONF_FILE}"
+
+BUILD_DEBS="yes"
+BUILD_PKG=""
+USE_PKG=""
+
+while [[ "${1#--}" != "${1}" ]]; do
+	case "${1}" in 
+		--pretend)
+			EXTRA_CONF="${EXTRA_CONF} -opt -pv"
+			;;
+		--depends)
+			EXTRA_CONF="${EXTRA_CONF} -depends"
+			OVERLAYS="${OVERLAYS} ${CLIP_BASE}/portage-overlay-dev ${CLIP_BASE}/portage-overlay-extra-dev"
+			MIRRORS="file://${CLIP_BASE}/distfiles-dev file://${CLIP_BASE}/distfiles-extra-dev ${MIRRORS}"
+			BUILD_DEBS=""
+			;;
+		--buildpkg)
+			BUILD_PKG="yes"
+			;;
+		--usepkg)
+			USE_PKG="yes"
+			;;
+		*)
+			die_usage "Unsupported option ${1}"
+			;;
+	esac
+	shift
+done	
+
+[[ -n "${BUILD_DEBS}" && -n "${BUILD_PKG}" ]] && die "--buildpkg only works with --depends"
+[[ -n "${BUILD_DEBS}" && -n "${USE_PKG}" ]] && die "--usepkg only works with --depends"
+
+[[ -n "${BUILD_DEBS}" ]] && EXTRA_CONF="${EXTRA_CONF} -dpkg"
+[[ -n "${BUILD_PKG}" ]] && EXTRA_CONF="${EXTRA_CONF} -buildpkg"
+[[ -n "${USE_PKG}" ]] && EXTRA_CONF="${EXTRA_CONF} -usepkg"
+
+if [[ -z "${CLIP_SPEC_DEFINES}" ]] ; then
+	CLIP_SPEC_DEFINES="CLIP_ARCH_${CLIP_ARCH}"
+else
+	CLIP_SPEC_DEFINES+=",CLIP_ARCH_${CLIP_ARCH}"
+fi
+
+[[ -n "${CLIP_SPEC_DEFINES}" ]] && EXTRA_CONF="${EXTRA_CONF} -defines ${CLIP_SPEC_DEFINES}"
+
+rm -f "/etc/make.skel"
+cat > "/etc/make.skel" <<EOF
+DISTDIR="/tmp/distfiles"
+MAKEOPTS="${CLIP_MAKEOPTS}"
+CHOST="${CLIP_CHOST}"
+GENTOO_MIRRORS="${MIRRORS}"
+FETCHCOMMAND="/usr/lib/portage/bin/clip-fetch \\\${URI} \\\${DISTDIR}/\\\${FILE}"
+RESUMECOMMAND="/usr/lib/portage/bin/clip-fetch \\\${URI} \\\${DISTDIR}/\\\${FILE}"
+EOF
+
+clip-build \
+	-dir ${CLIP_BASE}/portage \
+	-profilesdir ${CLIP_BASE}/portage-overlay-clip/profiles \
+	-debs ${DEBS_BASE}/${DEBS_REP} \
+	-tbz ${PKG_DIR} \
+	-overlay "${OVERLAYS}" \
+	-rootdir "/tmp/tmp" \
+	${EXTRA_CONF} \
+	-spec "${SPEC_FILE}" "${@}"
+

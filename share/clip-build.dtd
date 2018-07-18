@@ -1,0 +1,31 @@
+<!ELEMENT spec (specname,
+		use?,features?,cflags?,ldflags?,env?,profile?,
+		config+)>
+	<!ELEMENT config (id,confname,
+			rootdir?,pkgdir?,provided?,mask?,unmask?,
+			use?,features?,cflags?,ldflags?,profile?,env?,
+			pkg+)>
+		<!ELEMENT provided CDATA #REQUIRED>
+		<!ELEMENT virtuals CDATA #REQUIRED>
+		<!ELEMENT mask CDATA #REQUIRED>
+		<!ELEMENT unmask CDATA #REQUIRED>
+		<!ELEMENT pkg (id,pkgkey,pkgnames,
+				options?,accept_keywords?,optoverride?,
+				use?,features?,cflags?,ldflags?,env?
+			      )>
+			<!ELEMENT pkgkey CDATA #REQUIRED>
+			<!ELEMENT pkgnames CDATA #REQUIRED>
+			<!ELEMENT options CDATA #REQUIRED>
+			<!ELEMENT accept_keywords CDATA #REQUIRED>
+			<!ELEMENT optoverride CDATA #REQUIRED>
+		<!ELEMENT id CDATA #REQUIRED>
+		<!ELEMENT confname CDATA #REQUIRED>
+		<!ELEMENT rootdir CDATA #REQUIRED>
+		<!ELEMENT pkgdir CDATA #REQUIRED>
+	<!ELEMENT specname CDATA #REQUIRED>
+	<!ELEMENT use CDATA #REQUIRED>
+	<!ELEMENT features CDATA #REQUIRED>
+	<!ELEMENT cflags CDATA #REQUIRED>
+	<!ELEMENT ldflags CDATA #REQUIRED>
+	<!ELEMENT env CDATA #REQUIRED>
+	<!ELEMENT profile CDATA #REQUIRED>
