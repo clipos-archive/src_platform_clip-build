@@ -60,7 +60,6 @@ export CLIP_BUILDER
 [[ -n "${CLIP_ARCH}" ]] || die "CLIP_ARCH is not defined (define it in ${CONF_FILE})"
 
 OVERLAYS="${CLIP_BASE}/portage-overlay ${CLIP_BASE}/portage-overlay-clip ${CLIP_BASE}/portage-overlay-extra" 
-MIRRORS="file://${CLIP_BASE}/distfiles file://${CLIP_BASE}/distfiles-extra"
 
 [[ -n "${SPEC_FILE}" ]] || die_usage "No spec file passed in arguments"
 
@@ -86,7 +85,6 @@ while [[ "${1#--}" != "${1}" ]]; do
 		--depends)
 			EXTRA_CONF="${EXTRA_CONF} -depends"
 			OVERLAYS="${OVERLAYS} ${CLIP_BASE}/portage-overlay-dev ${CLIP_BASE}/portage-overlay-extra-dev"
-			MIRRORS="file://${CLIP_BASE}/distfiles-dev file://${CLIP_BASE}/distfiles-extra-dev ${MIRRORS}"
 			BUILD_DEBS=""
 			;;
 		--buildpkg)
@@ -119,12 +117,9 @@ fi
 
 rm -f "/etc/make.skel"
 cat > "/etc/make.skel" <<EOF
-DISTDIR="/tmp/distfiles"
+DISTDIR="${CLIP_BASE}/distfiles"
 MAKEOPTS="${CLIP_MAKEOPTS}"
 CHOST="${CLIP_CHOST}"
-GENTOO_MIRRORS="${MIRRORS}"
-FETCHCOMMAND="/usr/lib/portage/bin/clip-fetch \\\${URI} \\\${DISTDIR}/\\\${FILE}"
-RESUMECOMMAND="/usr/lib/portage/bin/clip-fetch \\\${URI} \\\${DISTDIR}/\\\${FILE}"
 EOF
 
 clip-build \
